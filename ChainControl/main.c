@@ -127,13 +127,13 @@ typedef struct {
 } EnvelopeCoeffs;
 
 typedef struct {
-	int8_t isActive;
+	int32_t isActive;
 	int32_t threshold;				// Q27
 } LimiterCoeffs;
 typedef LimiterCoeffs NoiseGateCoeffs;
 
 typedef struct {
-	int8_t isActive;
+	int32_t isActive;
 	int32_t threshold;				// Q27
 	int32_t C1;						// Q27
 	int32_t C2;						// Q27
@@ -151,13 +151,13 @@ typedef struct {
 } AmplitudeProcCoeffs;
 
 typedef struct {
-	uint8_t isActive;
+	int32_t isActive;
 	int32_t a[3];					// Q27
 	int32_t b[2];					// Q27
 } BiquadCoeffs;
 
 typedef struct {
-	int8_t isActive;
+	int32_t isActive;
 	BiquadCoeffs biquadCoeffs[EQ_BANDS_NUM];
 } EQCoeffs;
 
@@ -176,6 +176,9 @@ void init(Params *params, Coeffs *coeffs);
 void readConfig(FILE *configFilePtr, Params *params);
 void calcCoeffs(Params *params, Coeffs *coeffs);
 
+s32 SPIinitDevice(Cheetah *device);
+void writeCoeffs(Coeffs *coeffs, Cheetah *device);
+
 
 int main()
 {
@@ -188,9 +191,11 @@ int main()
 	readConfig(configFilePtr, &params);
 	calcCoeffs(&params, &coeffs);
 
-	u16 devsPortNums[10] = { 0 };
-	int devsNum = ch_find_devices(10, devsPortNums);
+	Cheetah device;
+	SPIinitDevice(&device);
+	writeCoeffs(&coeffs, &device);
 
+	ch_close(device);
 	return 0;
 }
 
@@ -804,7 +809,6 @@ void readConfig(FILE *configFilePtr, Params *params)
 	char str[100] = { 0 };
 	uint16_t paramId;
 	double paramValue;
-	uint8_t i;
 
 	while (fgets(str, 100, configFilePtr))
 	{
@@ -836,3 +840,243 @@ void readConfig(FILE *configFilePtr, Params *params)
 		}
 	}
 }
+
+
+//
+// *** SPI CONTROL ***
+//
+s32 SPIinitDevice(Cheetah *device)
+{
+	s32 status;
+	s32 bitrate;
+	u16 devsPortNums[1] = { 0 };
+	int devsNum = ch_find_devices(1, devsPortNums);
+	*device = ch_open(devsPortNums[0]);
+
+	status = ch_spi_configure(*device,
+					 CH_SPI_POL_RISING_FALLING,
+					 CH_SPI_PHASE_SAMPLE_SETUP,
+					 CH_SPI_BITORDER_MSB,
+					 0x0);
+	bitrate = ch_spi_bitrate(*device, 20000);
+
+	if (bitrate < 0)
+		return bitrate;
+
+	return status;
+}
+
+s32 SPIshift(Cheetah *device, u08 *dataOut, u32 nBytesOut,
+	u08 *dataIn, u32 nBytesIn)
+{
+	s32 status;
+
+	status = ch_spi_queue_clear(*device);
+	if (status < 0)
+		return status;
+
+	status = ch_spi_queue_oe(*device, 1);
+	if (status < 0)
+		return status;
+
+	status = ch_spi_queue_ss(*device, 0);
+	if (status < 0)
+		return status;
+
+	status = ch_spi_queue_ss(*device, 1);
+	if (status < 0)
+		return status;
+
+	status = ch_spi_queue_array(*device, nBytesOut, dataOut);
+	if (status < 0)
+		return status;
+
+	status = ch_spi_queue_ss(*device, 0);
+	if (status < 0)
+		return status;
+
+	status = ch_spi_queue_oe(*device, 0);
+	if (status < 0)
+		return status;
+
+	status = ch_spi_batch_shift(*device, nBytesIn, dataIn);
+
+	return status;
+}
+
+u32 reverse32(u32 x)
+{
+	return (x >> 24) |
+		   (x << 24) |
+		   ((x & 0x00ff0000) >> 8) |
+		   ((x & 0x0000ff00) << 8);
+}
+
+s32 SPIwrite32(Cheetah *device, u32 address, u32 *data)
+{
+	u08 *dataArr;
+	u08 CMD = 0x03;
+	u08 dummy = 0;
+	u32 dataSize = sizeof(CMD) + sizeof(address) + sizeof(dummy) + sizeof(u32);
+	u32 offset = 0;
+	s32 status;
+	u32 ackBytes = 0;
+
+	if (!(dataArr = (u08*)malloc(dataSize)))
+	{
+		return -1;
+	}
+
+	dataArr[offset++] = CMD;
+
+	*(u32*)&dataArr[offset] = reverse32(address);
+	offset += sizeof(address);
+
+	*(u32*)&dataArr[offset] = reverse32(*data);
+	offset += sizeof(*data);
+
+	dataArr[offset++] = dummy;
+
+	status = SPIshift(device, dataArr, dataSize, dataArr, dataSize);
+	if (status < 0)
+		return status;
+
+	if (0x80 == dataArr[dataSize - 1])
+		ackBytes = 4;
+
+	free(dataArr);
+	return ackBytes;
+}
+
+s32 SPIread32(Cheetah *device, u32 address, u32 *data)
+{
+	u08 *dataArr;
+	u08 CMD = 0x02;
+	u32 dummy = 0;
+	u32 dataSize = sizeof(CMD) + sizeof(address) + sizeof(dummy) + sizeof(u32);
+	u32 offset = 0;
+	s32 status;
+	u32 *pData;
+
+	if (!(dataArr = (u08*)malloc(dataSize)))
+	{
+		return -1;
+	}
+
+	dataArr[offset++] = CMD;
+	
+	*(u32*)&dataArr[offset] = reverse32(address);
+	offset += sizeof(address);
+
+	*(u32*)&dataArr[offset] = dummy;
+	offset += sizeof(dummy);
+
+	status = SPIshift(device, dataArr, dataSize, dataArr, dataSize);
+	if (status < 0)
+		return status;
+
+	pData = (u32*)&(dataArr[9]);
+	*data = reverse32(pData[0]);
+	
+	free(dataArr);
+	return 4;
+}
+
+void writeCoeffs(Coeffs *coeffs, Cheetah *device)
+{
+	u08 i;
+	u32 address = 0x60003904;
+
+	SPIwrite32(device, address, &coeffs->inputGain);
+	address += 0x4;
+	SPIwrite32(device, address, &coeffs->outputGain);
+	address += 0x4;
+	SPIwrite32(device, address, &coeffs->balanceL);
+	address += 0x4;
+	SPIwrite32(device, address, &coeffs->balanceR);
+	address += 0x4;
+	
+	// CrossFade
+	SPIwrite32(device, address, &coeffs->crossFadeCoeffs.targetGain);
+	address += 0x4;
+	SPIwrite32(device, address, &coeffs->crossFadeCoeffs.fadeAlpha);
+	address += 0x4;
+	
+	// Envelope
+	SPIwrite32(device, address, &coeffs->amplitudeProcCoeffs.envelope.alphaAttack);
+	address += 0x4;
+	SPIwrite32(device, address, &coeffs->amplitudeProcCoeffs.envelope.alphaRelease);
+	address += 0x4;
+	
+	// NoiseGate	
+	SPIwrite32(device, address, &coeffs->amplitudeProcCoeffs.noiseGate.isActive);
+	address += 0x4;
+	SPIwrite32(device, address, &coeffs->amplitudeProcCoeffs.noiseGate.threshold);
+	address += 0x4;
+	
+	// Limiter	
+	SPIwrite32(device, address, &coeffs->amplitudeProcCoeffs.limiter.isActive);
+	address += 0x4;
+	SPIwrite32(device, address, &coeffs->amplitudeProcCoeffs.limiter.threshold);
+	address += 0x4;
+
+	// Compressor
+	SPIwrite32(device, address, &coeffs->amplitudeProcCoeffs.compressor.isActive);
+	address += 0x4;
+	SPIwrite32(device, address, &coeffs->amplitudeProcCoeffs.compressor.threshold);
+	address += 0x4;
+	SPIwrite32(device, address, &coeffs->amplitudeProcCoeffs.compressor.C1);
+	address += 0x4;
+	SPIwrite32(device, address, &coeffs->amplitudeProcCoeffs.compressor.C2);
+	address += 0x4;
+	SPIwrite32(device, address, &coeffs->amplitudeProcCoeffs.compressor.alphaAttack);
+	address += 0x4;
+	SPIwrite32(device, address, &coeffs->amplitudeProcCoeffs.compressor.alphaRelease);
+	address += 0x4;
+
+	// Expander
+	SPIwrite32(device, address, &coeffs->amplitudeProcCoeffs.expander.isActive);
+	address += 0x4;
+	SPIwrite32(device, address, &coeffs->amplitudeProcCoeffs.expander.threshold);
+	address += 0x4;
+	SPIwrite32(device, address, &coeffs->amplitudeProcCoeffs.expander.C1);
+	address += 0x4;
+	SPIwrite32(device, address, &coeffs->amplitudeProcCoeffs.expander.C2);
+	address += 0x4;
+	SPIwrite32(device, address, &coeffs->amplitudeProcCoeffs.expander.alphaAttack);
+	address += 0x4;
+	SPIwrite32(device, address, &coeffs->amplitudeProcCoeffs.expander.alphaRelease);
+	address += 0x4;
+
+	// EQ
+	SPIwrite32(device, address, &coeffs->eqCoeffs.isActive);
+	address += 0x4;
+
+	for (i = 0; i < EQ_BANDS_NUM; i++)
+	{
+		SPIwrite32(device, address, &coeffs->eqCoeffs.biquadCoeffs[i].isActive);
+		address += 0x4;
+
+		SPIwrite32(device, address, &coeffs->eqCoeffs.biquadCoeffs[i].a[0]);
+		address += 0x4;
+
+		SPIwrite32(device, address, &coeffs->eqCoeffs.biquadCoeffs[i].a[1]);
+		address += 0x4;
+
+		SPIwrite32(device, address, &coeffs->eqCoeffs.biquadCoeffs[i].a[2]);
+		address += 0x4;
+
+		SPIwrite32(device, address, &coeffs->eqCoeffs.biquadCoeffs[i].b[0]);
+		address += 0x4;
+
+		SPIwrite32(device, address, &coeffs->eqCoeffs.biquadCoeffs[i].b[1]);
+		address += 0x4;
+	}
+
+	// isReadyToUpdate
+	u32 isReadyToUpdate = 0x1;
+	SPIwrite32(device, 0x60003900, &isReadyToUpdate);
+}
+//
+// *** SPI CONTROL END ***
+//
